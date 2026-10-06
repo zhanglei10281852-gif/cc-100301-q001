@@ -77,11 +77,12 @@ class PilotRepository:
     def interventions(self, session_id: int) -> list[dict[str, Any]]:
         return [dict(row) for row in self.connection.execute("SELECT * FROM pilot_interventions WHERE session_id=? ORDER BY id", (session_id,)).fetchall()]
 
-    def add_intervention(self, *, session_id: int, actor: str, action: str, reason: str, before: dict[str, Any], after: dict[str, Any], batch_key: str, now: str) -> None:
-        self.connection.execute(
+    def add_intervention(self, *, session_id: int, actor: str, action: str, reason: str, before: dict[str, Any], after: dict[str, Any], batch_key: str, now: str) -> int:
+        cursor = self.connection.execute(
             "INSERT INTO pilot_interventions(session_id,actor,action,reason,before_json,after_json,batch_key,created_at) VALUES(?,?,?,?,?,?,?,?)",
             (session_id, actor, action, reason, json.dumps(before, ensure_ascii=False, sort_keys=True), json.dumps(after, ensure_ascii=False, sort_keys=True), batch_key, now),
         )
+        return int(cursor.lastrowid)
 
     def list_sessions(self, *, status: str | None, project_code: str | None, requested_by: str | None, limit: int) -> list[dict[str, Any]]:
         clauses: list[str] = []
