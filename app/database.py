@@ -232,6 +232,8 @@ CREATE TABLE IF NOT EXISTS pilot_sessions (
     available_at TEXT NOT NULL,
     lease_owner TEXT NOT NULL DEFAULT '',
     lease_expires_at TEXT NOT NULL DEFAULT '',
+    lease_generation INTEGER NOT NULL DEFAULT 0,
+    handoff_from TEXT NOT NULL DEFAULT '',
     current_observation_version INTEGER,
     last_error_code TEXT NOT NULL DEFAULT '',
     last_error_message TEXT NOT NULL DEFAULT '',
@@ -266,6 +268,21 @@ CREATE TABLE IF NOT EXISTS pilot_interventions (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_pilot_interventions ON pilot_interventions(session_id,id);
+CREATE TABLE IF NOT EXISTS pilot_lease_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL REFERENCES pilot_sessions(id) ON DELETE CASCADE,
+    event_type TEXT NOT NULL CHECK(event_type IN ('granted','renewed','completed','failed','recovery','rejected')),
+    actor TEXT NOT NULL DEFAULT '',
+    generation INTEGER NOT NULL,
+    observed_version INTEGER,
+    accepted INTEGER NOT NULL CHECK(accepted IN (0,1)),
+    reason_code TEXT NOT NULL DEFAULT '',
+    detail TEXT NOT NULL DEFAULT '',
+    actual_owner TEXT NOT NULL DEFAULT '',
+    actual_generation INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pilot_lease_events ON pilot_lease_events(session_id,id);
 '''
 
 
@@ -330,11 +347,24 @@ def transaction(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
         connection.commit()
 
 
+def _migrate_lease_columns(connection: sqlite3.Connection) -> None:
+    """为旧版数据库补加租约世代与交接轨迹列。"""
+    existing = {row[1] for row in connection.execute("PRAGMA table_info(pilot_sessions)").fetchall()}
+    additions = {
+        "lease_generation": "INTEGER NOT NULL DEFAULT 0",
+        "handoff_from": "TEXT NOT NULL DEFAULT ''",
+    }
+    for column, declaration in additions.items():
+        if column not in existing:
+            connection.execute(f"ALTER TABLE pilot_sessions ADD COLUMN {column} {declaration}")
+
+
 def init_db() -> None:
     now = to_storage(utc_now())
     with transaction(immediate=True) as connection:
         connection.executescript(SCHEMA)
-        connection.execute("PRAGMA user_version=2")
+        _migrate_lease_columns(connection)
+        connection.execute("PRAGMA user_version=3")
         for code, name, resource, action in PERMISSIONS:
             connection.execute(
                 "INSERT OR IGNORE INTO permissions(code,name,resource,action) VALUES(?,?,?,?)",

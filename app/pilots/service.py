@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import hashlib
 import json
@@ -15,6 +15,19 @@ from app.database import get_connection, transaction
 def digest(value: Any) -> str:
     text = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(text.encode()).hexdigest()
+
+
+class LeaseRejectedError(ConflictError):
+    """旧持有者或过期请求被 fencing 规则拒绝，context 携带现场信息。"""
+
+    code = "lease_rejected"
+
+
+# 条件更新 WHERE 片段：必须同时是当前持有者、世代未失效、租约尚未到期。
+_HOLDER_GUARD = (
+    "status='running' AND lease_owner=? AND lease_generation=? "
+    "AND lease_expires_at<>'' AND lease_expires_at>?"
+)
 
 
 class PilotOperationsService:
@@ -78,8 +91,11 @@ class PilotOperationsService:
         if row is None:
             raise NotFoundError("运营游览场次不存在")
         observation = dict(row)
+        events = self.repository.lease_events(session_id)
         observation["observations"] = self.repository.observation_versions(session_id)
         observation["interventions"] = self.repository.interventions(session_id)
+        observation["lease_events"] = self._compact_events(events, limit=100)
+        observation["handoff_trail"] = self._handoff_trail(events)
         return observation
 
     def claim(self, site_code: str, capabilities: list[str], lease_seconds: int) -> dict[str, Any] | None:
@@ -91,66 +107,145 @@ class PilotOperationsService:
             candidate = repository.queued_candidate(capabilities, now)
             if candidate is None:
                 return None
+            previous_owner = candidate["handoff_from"]
+            new_generation = int(candidate["lease_generation"]) + 1
             cursor = connection.execute(
-                "UPDATE pilot_sessions SET status='running',attempt_count=attempt_count+1,lease_owner=?,lease_expires_at=?,started_at=COALESCE(started_at,?),updated_at=?,version=version+1 WHERE id=? AND status='queued'",
-                (site_code, lease_until, now, now, candidate["id"]),
+                "UPDATE pilot_sessions SET status='running',attempt_count=attempt_count+1,lease_owner=?,lease_expires_at=?,"
+                "lease_generation=?,started_at=COALESCE(started_at,?),updated_at=?,version=version+1 "
+                "WHERE id=? AND status='queued'",
+                (site_code, lease_until, new_generation, now, now, candidate["id"]),
             )
             if cursor.rowcount != 1:
                 return None
+            repository.add_lease_event(
+                session_id=candidate["id"], event_type="granted", actor=site_code, generation=new_generation,
+                accepted=True, detail=(f"从 {previous_owner} 交接后重新领取" if previous_owner else "首次领取"), now=now,
+            )
             return dict(repository.session_by_id(candidate["id"]))
 
-    def heartbeat(self, session_id: int, site_code: str, lease_seconds: int) -> dict[str, Any]:
+    def heartbeat(self, session_id: int, site_code: str, lease_generation: int, lease_seconds: int) -> dict[str, Any]:
         now_value = self.clock.now()
         now = to_storage(now_value)
         expires = to_storage(now_value + timedelta(seconds=lease_seconds))
-        with transaction(immediate=True) as connection:
-            cursor = connection.execute(
-                "UPDATE pilot_sessions SET lease_expires_at=?,updated_at=?,version=version+1 WHERE id=? AND status='running' AND lease_owner=?",
-                (expires, now, session_id, site_code),
-            )
-            if cursor.rowcount != 1:
-                raise ConflictError("游览场次未由当前执行站点持有")
-            return dict(PilotRepository(connection).session_by_id(session_id))
-
-    def complete(self, session_id: int, site_code: str, observation: dict[str, Any], metrics: dict[str, Any]) -> dict[str, Any]:
-        now = to_storage(self.clock.now())
+        rejected: LeaseRejectedError | None = None
+        result: dict[str, Any] | None = None
         with transaction(immediate=True) as connection:
             repository = PilotRepository(connection)
             session = repository.session_by_id(session_id)
             if session is None:
                 raise NotFoundError("运营游览场次不存在")
-            if session["status"] != "running" or session["lease_owner"] != site_code:
-                raise ConflictError("游览场次未由当前执行站点持有")
-            version = int(connection.execute("SELECT COALESCE(MAX(version),0)+1 FROM pilot_observations WHERE session_id=?", (session_id,)).fetchone()[0])
-            connection.execute(
-                "INSERT INTO pilot_observations(session_id,version,observation_json,metrics_json,observation_digest,created_by,created_at) VALUES(?,?,?,?,?,?,?)",
-                (session_id, version, json.dumps(observation, ensure_ascii=False, sort_keys=True), json.dumps(metrics, ensure_ascii=False, sort_keys=True), digest({"observation": observation, "metrics": metrics}), site_code, now),
+            # 续租必须同时满足：租约尚未到期 + 节点仍是当前持有者 + 世代令牌一致。
+            cursor = connection.execute(
+                "UPDATE pilot_sessions SET lease_expires_at=?,updated_at=?,version=version+1 "
+                f"WHERE id=? AND {_HOLDER_GUARD}",
+                (expires, now, session_id, site_code, lease_generation, now),
             )
-            connection.execute(
-                "UPDATE pilot_sessions SET status='succeeded',current_observation_version=?,lease_owner='',lease_expires_at='',finished_at=?,updated_at=?,version=version+1 WHERE id=?",
-                (version, now, now, session_id),
-            )
-            return dict(repository.session_by_id(session_id))
+            if cursor.rowcount == 1:
+                repository.add_lease_event(
+                    session_id=session_id, event_type="renewed", actor=site_code, generation=lease_generation,
+                    accepted=True, now=now,
+                )
+                result = dict(repository.session_by_id(session_id))
+            else:
+                reason = self._reject_reason(session, site_code, lease_generation, now)
+                rejected = self._record_rejection(
+                    repository, session, event_type="renewed", requester=site_code,
+                    request_generation=lease_generation, observed_version=None,
+                    reason=reason, detail=self._reject_detail("续租", reason, site_code, session), now=now,
+                )
+        if rejected is not None:
+            raise rejected
+        return result  # type: ignore[return-value]
 
-    def fail(self, session_id: int, site_code: str, error_code: str, message: str, retryable: bool) -> dict[str, Any]:
+    def complete(self, session_id: int, site_code: str, lease_generation: int, observation: dict[str, Any], metrics: dict[str, Any], observed_version: int | None = None) -> dict[str, Any]:
         now_value = self.clock.now()
         now = to_storage(now_value)
+        rejected: LeaseRejectedError | None = None
+        result: dict[str, Any] | None = None
         with transaction(immediate=True) as connection:
             repository = PilotRepository(connection)
             session = repository.session_by_id(session_id)
             if session is None:
                 raise NotFoundError("运营游览场次不存在")
-            if session["status"] != "running" or session["lease_owner"] != site_code:
-                raise ConflictError("游览场次未由当前执行站点持有")
-            can_retry = retryable and int(session["attempt_count"]) < int(session["max_attempts"])
-            status = "queued" if can_retry else "failed"
-            delay = min(300, 2 ** max(0, int(session["attempt_count"]) - 1)) if can_retry else 0
-            available = to_storage(now_value + timedelta(seconds=delay))
-            connection.execute(
-                "UPDATE pilot_sessions SET status=?,available_at=?,lease_owner='',lease_expires_at='',last_error_code=?,last_error_message=?,finished_at=?,updated_at=?,version=version+1 WHERE id=?",
-                (status, available, error_code, message[:2000], None if can_retry else now, now, session_id),
-            )
-            return dict(repository.session_by_id(session_id))
+            version_reason = self._version_reason(session, observed_version)
+            if version_reason is not None:
+                rejected = self._record_rejection(
+                    repository, session, event_type="completed", requester=site_code,
+                    request_generation=lease_generation, observed_version=observed_version,
+                    reason=version_reason, detail=self._reject_detail("完成回执", version_reason, site_code, session), now=now,
+                )
+            else:
+                version = int(connection.execute("SELECT COALESCE(MAX(version),0)+1 FROM pilot_observations WHERE session_id=?", (session_id,)).fetchone()[0])
+                # 先做 fencing 条件更新，确保观察记录只在持有者合法时落库。
+                cursor = connection.execute(
+                    "UPDATE pilot_sessions SET status='succeeded',current_observation_version=?,lease_owner='',lease_expires_at='',"
+                    f"finished_at=?,updated_at=?,version=version+1 WHERE id=? AND {_HOLDER_GUARD}",
+                    (version, now, now, session_id, site_code, lease_generation, now),
+                )
+                if cursor.rowcount == 1:
+                    connection.execute(
+                        "INSERT INTO pilot_observations(session_id,version,observation_json,metrics_json,observation_digest,created_by,created_at) VALUES(?,?,?,?,?,?,?)",
+                        (session_id, version, json.dumps(observation, ensure_ascii=False, sort_keys=True), json.dumps(metrics, ensure_ascii=False, sort_keys=True), digest({"observation": observation, "metrics": metrics}), site_code, now),
+                    )
+                    repository.add_lease_event(
+                        session_id=session_id, event_type="completed", actor=site_code, generation=lease_generation,
+                        observed_version=version, accepted=True, now=now,
+                    )
+                    result = dict(repository.session_by_id(session_id))
+                else:
+                    reason = self._reject_reason(session, site_code, lease_generation, now)
+                    rejected = self._record_rejection(
+                        repository, session, event_type="completed", requester=site_code,
+                        request_generation=lease_generation, observed_version=observed_version,
+                        reason=reason, detail=self._reject_detail("完成回执", reason, site_code, session), now=now,
+                    )
+        if rejected is not None:
+            raise rejected
+        return result  # type: ignore[return-value]
+
+    def fail(self, session_id: int, site_code: str, lease_generation: int, error_code: str, message: str, retryable: bool, observed_version: int | None = None) -> dict[str, Any]:
+        now_value = self.clock.now()
+        now = to_storage(now_value)
+        rejected: LeaseRejectedError | None = None
+        result: dict[str, Any] | None = None
+        with transaction(immediate=True) as connection:
+            repository = PilotRepository(connection)
+            session = repository.session_by_id(session_id)
+            if session is None:
+                raise NotFoundError("运营游览场次不存在")
+            version_reason = self._version_reason(session, observed_version)
+            if version_reason is not None:
+                rejected = self._record_rejection(
+                    repository, session, event_type="failed", requester=site_code,
+                    request_generation=lease_generation, observed_version=observed_version,
+                    reason=version_reason, detail=self._reject_detail("失败回执", version_reason, site_code, session), now=now,
+                )
+            else:
+                can_retry = retryable and int(session["attempt_count"]) < int(session["max_attempts"])
+                status = "queued" if can_retry else "failed"
+                delay = min(300, 2 ** max(0, int(session["attempt_count"]) - 1)) if can_retry else 0
+                available = to_storage(now_value + timedelta(seconds=delay))
+                cursor = connection.execute(
+                    "UPDATE pilot_sessions SET status=?,available_at=?,lease_owner='',lease_expires_at='',handoff_from=?,last_error_code=?,"
+                    f"last_error_message=?,finished_at=?,updated_at=?,version=version+1 WHERE id=? AND {_HOLDER_GUARD}",
+                    (status, available, site_code, error_code, message[:2000], None if can_retry else now, now, session_id, site_code, lease_generation, now),
+                )
+                if cursor.rowcount == 1:
+                    repository.add_lease_event(
+                        session_id=session_id, event_type="failed", actor=site_code, generation=lease_generation,
+                        observed_version=observed_version, accepted=True, reason_code=error_code, now=now,
+                    )
+                    result = dict(repository.session_by_id(session_id))
+                else:
+                    reason = self._reject_reason(session, site_code, lease_generation, now)
+                    rejected = self._record_rejection(
+                        repository, session, event_type="failed", requester=site_code,
+                        request_generation=lease_generation, observed_version=observed_version,
+                        reason=reason, detail=self._reject_detail("失败回执", reason, site_code, session), now=now,
+                    )
+        if rejected is not None:
+            raise rejected
+        return result  # type: ignore[return-value]
 
     def cancel(self, session_id: int, actor: str, reason: str, batch_key: str = "") -> dict[str, Any]:
         return self._intervene(session_id, actor, reason, "cancel", batch_key, self._cancel_mutation)
@@ -160,7 +255,11 @@ class PilotOperationsService:
             if session["status"] not in {"failed", "cancelled"}:
                 raise ConflictError("只有失败或已取消游览场次可以人工重试")
             chosen = session["priority"] if priority is None else priority
-            connection.execute("UPDATE pilot_sessions SET status='queued',priority=?,available_at=?,lease_owner='',lease_expires_at='',finished_at=NULL,updated_at=?,version=version+1 WHERE id=?", (chosen, now, now, session["id"]))
+            connection.execute(
+                "UPDATE pilot_sessions SET status='queued',priority=?,available_at=?,lease_owner='',lease_expires_at='' ,"
+                "lease_generation=lease_generation+1,finished_at=NULL,updated_at=?,version=version+1 WHERE id=?",
+                (chosen, now, now, session["id"]),
+            )
         return self._intervene(session_id, actor, reason, "retry", batch_key, mutate)
 
     def set_priority(self, session_id: int, actor: str, reason: str, priority: int, batch_key: str = "") -> dict[str, Any]:
@@ -193,20 +292,37 @@ class PilotOperationsService:
         exhausted: list[int] = []
         with transaction(immediate=True) as connection:
             repository = PilotRepository(connection)
-            rows = connection.execute("SELECT * FROM pilot_sessions WHERE status='running' AND lease_expires_at<>'' AND lease_expires_at<? ORDER BY id", (now,)).fetchall()
+            # 条件更新保证：与旧节点续租同一时刻竞争时，只有一边的 WHERE 能命中。
+            rows = connection.execute(
+                "SELECT * FROM pilot_sessions WHERE status='running' AND lease_expires_at<>'' AND lease_expires_at<? ORDER BY id",
+                (now,),
+            ).fetchall()
             for session in rows:
                 before = dict(session)
                 if int(session["attempt_count"]) < int(session["max_attempts"]):
                     status, finished_at = "queued", None
-                    recovered.append(int(session["id"]))
                 else:
                     status, finished_at = "failed", now
-                    exhausted.append(int(session["id"]))
-                connection.execute(
-                    "UPDATE pilot_sessions SET status=?,lease_owner='',lease_expires_at='',available_at=?,last_error_code='lease_expired',last_error_message='执行站点租约已过期',finished_at=?,updated_at=?,version=version+1 WHERE id=?",
-                    (status, now, finished_at, now, session["id"]),
+                previous_owner = session["lease_owner"]
+                cursor = connection.execute(
+                    "UPDATE pilot_sessions SET status=?,lease_owner='',lease_expires_at='',lease_generation=lease_generation+1,"
+                    "handoff_from=?,available_at=?,last_error_code='lease_expired',last_error_message='执行站点租约已过期',"
+                    "finished_at=?,updated_at=?,version=version+1 WHERE id=? AND status='running' AND lease_expires_at<>'' AND lease_expires_at<?",
+                    (status, previous_owner, now, finished_at, now, session["id"], now),
                 )
+                if cursor.rowcount != 1:
+                    # 并发竞争中旧持有者先一步续租成功：本场次不再恢复，保持其运行状态。
+                    continue
+                if status == "queued":
+                    recovered.append(int(session["id"]))
+                else:
+                    exhausted.append(int(session["id"]))
                 after = dict(repository.session_by_id(session["id"]))
+                repository.add_lease_event(
+                    session_id=session["id"], event_type="recovery", actor=actor, generation=int(after["lease_generation"]),
+                    accepted=True, reason_code="lease_expired",
+                    detail=f"{previous_owner} 失联超过租约期限，移交为 {status}", now=now,
+                )
                 repository.add_intervention(session_id=session["id"], actor=actor, action="lease_recovery", reason="租约过期自动恢复", before=before, after=after, batch_key="", now=now)
         return {"recovered": recovered, "exhausted": exhausted}
 
@@ -214,6 +330,116 @@ class PilotOperationsService:
         rows = self.connection.execute("SELECT status,COUNT(*) AS amount FROM pilot_sessions GROUP BY status ORDER BY status").fetchall()
         oldest = self.connection.execute("SELECT MIN(created_at) FROM pilot_sessions WHERE status='queued'").fetchone()[0]
         return {"states": {row["status"]: row["amount"] for row in rows}, "oldest_queued_at": oldest, "protocols": len(self.repository.active_protocols())}
+
+    # ------------------------------------------------------------------
+    # 租约 fencing 辅助
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _reject_reason(session: sqlite3.Row, requester: str, request_generation: int, now: str) -> str:
+        """条件更新未命中时判定具体拒绝原因（调用时持 IMMEDIATE 事务锁，读到的是最新已提交状态）。"""
+        if session["status"] == "running":
+            if not session["lease_expires_at"] or session["lease_expires_at"] <= now:
+                return "lease_expired"
+            if session["lease_owner"] != requester:
+                return "not_holder"
+            if int(session["lease_generation"]) != int(request_generation):
+                return "stale_generation"
+            return "not_holder"
+        if session["status"] == "queued":
+            # 租约已被恢复并重新排队，旧持有者世代已经失效。
+            return "stale_generation"
+        return "duplicate_terminal"
+
+    @staticmethod
+    def _version_reason(session: sqlite3.Row, observed_version: int | None) -> str | None:
+        """回执必须基于场次当前观察版本，迟到或重复回执不能覆盖新节点的状态。"""
+        if observed_version is None:
+            return None
+        current = session["current_observation_version"]
+        if current is not None and int(observed_version) < int(current):
+            return "stale_observation"
+        if int(observed_version) > int(current or 0):
+            return "future_observation"
+        return None
+
+    @staticmethod
+    def _reject_detail(action: str, reason: str, requester: str, session: sqlite3.Row) -> str:
+        messages = {
+            "lease_expired": f"{requester} 的租约已过期，{action}被拒绝",
+            "not_holder": f"{requester} 不是当前持有者（实际持有者：{session['lease_owner'] or '无，已重新排队'}），{action}被拒绝",
+            "stale_generation": f"{requester} 持有的是旧世代租约，场次已经移交，{action}被拒绝",
+            "stale_observation": f"回执基于旧观察版本，当前版本为 {session['current_observation_version']}，{action}被拒绝",
+            "future_observation": "回执观察版本超出当前场次版本，被拒绝",
+            "duplicate_terminal": f"场次当前状态为 {session['status']}，迟到或重复的{action}只能记录不能覆盖新节点的状态",
+        }
+        return messages[reason]
+
+    def _record_rejection(
+        self, repository: PilotRepository, session: sqlite3.Row, *, event_type: str, requester: str,
+        request_generation: int, observed_version: int | None, reason: str, detail: str, now: str,
+    ) -> LeaseRejectedError:
+        repository.add_lease_event(
+            session_id=session["id"], event_type=event_type, actor=requester, generation=request_generation,
+            observed_version=observed_version, accepted=False, reason_code=reason, detail=detail,
+            actual_owner=session["lease_owner"], actual_generation=int(session["lease_generation"]), now=now,
+        )
+        events = repository.lease_events(session["id"])
+        interventions = repository.interventions(session["id"])
+        needs_manual = reason in {"lease_expired", "not_holder", "stale_generation", "stale_observation"}
+        context = {
+            "session_id": session["id"],
+            "rejected": True,
+            "reason_code": reason,
+            "requester": requester,
+            "request_generation": request_generation,
+            "observed_version": observed_version,
+            "actual_holder": session["lease_owner"],
+            "actual_generation": int(session["lease_generation"]),
+            "actual_status": session["status"],
+            "current_observation_version": session["current_observation_version"],
+            "manual_intervention_required": needs_manual,
+            "manual_interventions": [
+                {"action": item["action"], "actor": item["actor"], "reason": item["reason"], "at": item["created_at"]}
+                for item in interventions[-5:]
+            ],
+            "handoff_trail": self._handoff_trail(events),
+            "recent_lease_events": self._compact_events(events),
+        }
+        return LeaseRejectedError(detail, context=context)
+
+    @staticmethod
+    def _compact_events(events: list[dict[str, Any]], *, limit: int = 10) -> list[dict[str, Any]]:
+        return [
+            {
+                "seq": event["id"],
+                "at": event["created_at"],
+                "type": event["event_type"],
+                "site": event["actor"],
+                "generation": event["generation"],
+                "observed_version": event["observed_version"],
+                "accepted": bool(event["accepted"]),
+                "reason_code": event["reason_code"],
+                "detail": event["detail"],
+                "actual_holder": event["actual_owner"],
+                "actual_generation": event["actual_generation"],
+            }
+            for event in events[-limit:]
+        ]
+
+    @staticmethod
+    def _handoff_trail(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        trail: list[dict[str, Any]] = []
+        for event in events:
+            if event["accepted"] and event["event_type"] in {"granted", "recovery"}:
+                trail.append({
+                    "at": event["created_at"],
+                    "generation": event["generation"],
+                    "holder": event["actor"] if event["event_type"] == "granted" else "",
+                    "kind": event["event_type"],
+                    "detail": event["detail"],
+                })
+        return trail
 
     def _intervene(self, session_id: int, actor: str, reason: str, action: str, batch_key: str, mutation: Callable[[sqlite3.Connection, sqlite3.Row, str], None]) -> dict[str, Any]:
         now = to_storage(self.clock.now())
@@ -284,5 +510,3 @@ class PilotOperationsService:
                 raise ValidationError(f"参数 {name} 不在允许的选项中")
             normalized[name] = value
         return normalized
-
-

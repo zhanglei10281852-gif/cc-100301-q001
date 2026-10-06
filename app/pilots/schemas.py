@@ -38,14 +38,24 @@ class SessionClaim(BaseModel):
     lease_seconds: int = Field(default=60, ge=5, le=3600)
 
 
+class SessionHeartbeat(BaseModel):
+    site_code: str = Field(min_length=1, max_length=120)
+    lease_generation: int = Field(ge=1, description="领取租约时获得的世代令牌，续租必须原样带回")
+    lease_seconds: int = Field(default=60, ge=5, le=3600)
+
+
 class SessionObservation(BaseModel):
     site_code: str = Field(min_length=1, max_length=120)
+    lease_generation: int = Field(ge=1, description="当前持有租约的世代令牌，旧持有者的回执会被拒绝")
+    observed_version: int | None = Field(default=None, ge=0, description="执行方看到的场次观察版本，用于拦截迟到回执")
     observation: dict[str, Any]
     metrics: dict[str, Any] = Field(default_factory=dict)
 
 
 class SessionFailure(BaseModel):
     site_code: str = Field(min_length=1, max_length=120)
+    lease_generation: int = Field(ge=1, description="当前持有租约的世代令牌，旧持有者的回执会被拒绝")
+    observed_version: int | None = Field(default=None, ge=0)
     error_code: str = Field(min_length=1, max_length=120)
     message: str = Field(min_length=1, max_length=2000)
     retryable: bool = True

@@ -77,6 +77,15 @@ class PilotRepository:
     def interventions(self, session_id: int) -> list[dict[str, Any]]:
         return [dict(row) for row in self.connection.execute("SELECT * FROM pilot_interventions WHERE session_id=? ORDER BY id", (session_id,)).fetchall()]
 
+    def lease_events(self, session_id: int) -> list[dict[str, Any]]:
+        return [dict(row) for row in self.connection.execute("SELECT * FROM pilot_lease_events WHERE session_id=? ORDER BY id", (session_id,)).fetchall()]
+
+    def add_lease_event(self, *, session_id: int, event_type: str, actor: str, generation: int, accepted: bool, reason_code: str = "", detail: str = "", observed_version: int | None = None, actual_owner: str = "", actual_generation: int = 0, now: str) -> None:
+        self.connection.execute(
+            "INSERT INTO pilot_lease_events(session_id,event_type,actor,generation,observed_version,accepted,reason_code,detail,actual_owner,actual_generation,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (session_id, event_type, actor, generation, observed_version, 1 if accepted else 0, reason_code, detail, actual_owner, actual_generation, now),
+        )
+
     def add_intervention(self, *, session_id: int, actor: str, action: str, reason: str, before: dict[str, Any], after: dict[str, Any], batch_key: str, now: str) -> None:
         self.connection.execute(
             "INSERT INTO pilot_interventions(session_id,actor,action,reason,before_json,after_json,batch_key,created_at) VALUES(?,?,?,?,?,?,?,?)",
